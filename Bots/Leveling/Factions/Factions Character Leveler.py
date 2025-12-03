@@ -346,18 +346,55 @@ def CraftRemainingArmor():
 
 #region Routines
 def _on_death(bot: "Botting"):
-    bot.Properties.ApplyNow("pause_on_danger", "active", False)
-    bot.Properties.ApplyNow("halt_on_death","active", True)
-    bot.Properties.ApplyNow("movement_timeout","value", 15000)
-    bot.Properties.ApplyNow("auto_combat","active", False)
-    yield from Routines.Yield.wait(8000)
     fsm = bot.config.FSM
-    fsm.jump_to_state_by_name("[H]Acquire Kieran's Bow_4") 
-    fsm.resume()                           
+    
+    # Store the current state
+    current_state_name = fsm.get_current_step_name() if fsm.current_state else None
+    
+    ConsoleLog("Death Handler", f"Player died at state: {current_state_name}", Py4GW.Console.MessageType.Warning)
+    
+    # Wait for player to be alive again
+    max_wait_iterations = 120  # 120 seconds max wait (120 * 1000ms)
+    wait_count = 0
+    
+    ConsoleLog("Death Handler", "Waiting for player to resurrect...", Py4GW.Console.MessageType.Info)
+    
+    while wait_count < max_wait_iterations:
+        yield from Routines.Yield.wait(1000)
+        wait_count += 1
+        
+        # Check if player is alive
+        player_id = GLOBAL_CACHE.Player.GetAgentID()
+        if player_id and not GLOBAL_CACHE.Agent.IsDead(player_id):
+            ConsoleLog("Death Handler", "Player is alive! Resuming bot...", Py4GW.Console.MessageType.Success)
+            break
+    else:
+        # Timeout reached
+        ConsoleLog("Death Handler", "Timeout waiting for resurrection. Stopping bot.", Py4GW.Console.MessageType.Error)
+        bot.Stop()
+        return
+    
+    # Give a moment for the game to stabilize after resurrection
+    yield from Routines.Yield.wait(2000)
+    
+    # Reset to the current state (or restart if no valid state)
+    if current_state_name and fsm.has_state(current_state_name):
+        ConsoleLog("Death Handler", f"Restarting from state: {current_state_name}", Py4GW.Console.MessageType.Info)
+        fsm.jump_to_state_by_name(current_state_name)
+    else:
+        ConsoleLog("Death Handler", "No valid state to resume, restarting FSM from beginning", Py4GW.Console.MessageType.Warning)
+        fsm.reset()
+        fsm.start()
+    
+    # Resume the FSM
+    fsm.resume()
     yield  
     
 def on_death(bot: "Botting"):
-    print ("Player is dead. Run Failed, Restarting...")
+    """
+    Called when player dies. Pauses the FSM and starts the death handling coroutine.
+    """
+    ConsoleLog("Death Handler", "Player is dead. Initiating recovery...", Py4GW.Console.MessageType.Warning)
     ActionQueueManager().ResetAllQueues()
     fsm = bot.config.FSM
     fsm.pause()
