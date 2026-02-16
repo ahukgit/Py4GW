@@ -29,19 +29,19 @@ def _remove_flag():
 _VERIFY_TIMEOUT = 1.0  # seconds
 
 class BlessingNpc(Enum):
-    Sunspear_Scout      = (4778, 4776)
-    Wandering_Priest    = (5384, 5383)
-    Vabbian_Scout       = (5632,)
-    Ghostly_Scout       = (5547, 5548)
-    Ghostly_Priest      = (5615,)
-    Whispers_Informants = (5218, 5683)
-    Forgotten_Warden    = (5002,)
-    Kurzick_Priest      = (593, 912, 3426)
-    Luxon_Priest        = (1947, 3641)
-    Beacons_of_Droknar  = (5865,)
-    Ascalonian_Refugees = (1986, 1987, 6044, 6045, 6043)
-    Asuran_Krewe        = (6755, 6756, 6775, 6779)
-    Norn_Hunters        = (6374, 6380)
+    Sunspear_Scout      = (4778, 4776, 4827, 4829)
+    Wandering_Priest    = (5384, 5383, 5434)
+    Vabbian_Scout       = (5632, 5683,)
+    Ghostly_Scout       = (5547, 5548, 5599)
+    Ghostly_Priest      = (5615, 5666)
+    Whispers_Informants = (5218, 5683, 5734)
+    Forgotten_Warden    = (5002, 5053)
+    Kurzick_Priest      = (593, 912, 3426, 3477)
+    Luxon_Priest        = (1947, 3641, 3692)
+    Beacons_of_Droknar  = (5865, 5916)
+    Ascalonian_Refugees = (1986, 1987, 6044, 6045, 6043, 6094)
+    Asuran_Krewe        = (6755, 6756, 6775, 6779, 6830)
+    Norn_Hunters        = (6374, 6380, 6431)
 
     def __init__(self, *mids: int):
         self.model_ids = mids
@@ -392,5 +392,6 @@ class BlessingRunner:
             return False
 
         return False
+
 
 __all__ = ["_Mover", "move_interact_blessing_npc"]

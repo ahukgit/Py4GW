@@ -10,7 +10,10 @@ from HeroAI.cache_data import *
 import time
 import math
 import importlib.util
-from Sources.aC_Scripts.aC_api.Blessing_Core import get_blessing_npc
+from typing import Optional
+from Sources.aC_Scripts.aC_api.Verify_Blessing import has_any_blessing
+from Sources.aC_Scripts.aC_api.Blessing_dialog_helper import is_npc_dialog_visible, click_dialog_button
+from Sources.aC_Scripts.aC_api.Blessing_Core import BlessingNpc
 from Sources.aC_Scripts.aC_api.Titles import (
     display_title_track, display_faction, display_title_progress,
     vanguard_tiers, norn_tiers, asura_tiers, deldrimor_tiers,
@@ -62,13 +65,12 @@ class FSMVars:
         self.in_killing_routine = False
         self.last_skill_time = 0
         self.current_skill = 1
-        self.blessing_timer = Timer()
-        self.has_blessing = False
-        self.in_blessing_dialog = False
-        self.get_blessing_delay_start = None
         self.blessing_points = []
         self.blessing_triggered = set()
         self.blessing_timers = {}
+        self.blessing_interact_logged = set()
+        self.current_blessing_npc: Optional[int] = None
+        self.blessing_dialog_wait_time = 0.0
 
 class BotVars:
     def __init__(self):
@@ -97,21 +99,100 @@ class BotVars:
         self.map_data = {}
 
 def trigger_blessing_at(point):
+    """Move to blessing coordinates and acquire the blessing with dialog"""
     if point in FSM_vars.blessing_triggered:
         return
 
-    if point not in FSM_vars.blessing_timers:
-        FSM_vars.blessing_timers[point] = time.time()
+    if has_any_blessing(Player.GetAgentID()):
+        ConsoleLog("Blessing", "Already have a blessing, skipping", Console.MessageType.Info)
+        FSM_vars.blessing_triggered.add(point)
         return
-
-    if time.time() - FSM_vars.blessing_timers[point] < 5.0:
-        return
-
-    ConsoleLog("Blessing", f"Triggering blessing at {point}", Console.MessageType.Info)
-    if blessed:
-        blessed.module.Get_Blessed()
     
-    FSM_vars.blessing_triggered.add(point)
+    # First, move to the blessing point coordinates
+    px, py = Player.GetXY()
+    bx, by = point
+    dist = Utils.Distance((px, py), (bx, by))
+    
+    if dist > 300:  # Move closer if far away
+        Player.Move(bx, by)
+        return
+    
+    # We're close to the blessing point now, initialize on first approach
+    if point not in FSM_vars.blessing_timers:
+        ConsoleLog("Blessing", f"Reached blessing point {point}, searching for NPC...", Console.MessageType.Info)
+        FSM_vars.blessing_timers[point] = time.time()
+        FSM_vars.current_blessing_npc = None
+        return
+
+    # Now find the closest BLESSING NPC nearby
+    if FSM_vars.current_blessing_npc is None:
+        px, py = Player.GetXY()
+        closest_npc = None
+        closest_dist = float('inf')
+        
+        # Build a set of all valid blessing NPC model IDs
+        valid_blessing_models = set()
+        for npc_type in BlessingNpc:
+            valid_blessing_models.update(npc_type.model_ids)
+        
+        for ag in AgentArray.GetAgentArray():
+            try:
+                ax, ay = Agent.GetXY(ag)
+                dist = Utils.Distance((px, py), (ax, ay))
+                # Skip self (player)
+                if dist == 0:
+                    continue
+                # Only pick blessing NPCs within 500 units
+                model_id = Agent.GetModelID(ag)
+                if model_id in valid_blessing_models and dist < 500 and dist < closest_dist:
+                    closest_npc = ag
+                    closest_dist = dist
+            except:
+                continue
+        
+        if closest_npc is not None:
+            ConsoleLog("Blessing", f"Found NPC (model ID: {Agent.GetModelID(closest_npc)}) at distance {closest_dist:.0f}", Console.MessageType.Info)
+            FSM_vars.current_blessing_npc = closest_npc
+        elif time.time() - FSM_vars.blessing_timers[point] > 10.0:
+            ConsoleLog("Blessing", f"Timeout: No NPC found after 10 seconds", Console.MessageType.Warning)
+            FSM_vars.blessing_triggered.add(point)
+        return
+    
+    # We have an NPC, move to it and interact
+    npc_agent = FSM_vars.current_blessing_npc
+    
+    try:
+        npc_x, npc_y = Agent.GetXY(npc_agent)
+        npc_model_id = Agent.GetModelID(npc_agent)
+    except:
+        FSM_vars.current_blessing_npc = None
+        return
+    
+    player_x, player_y = Player.GetXY()
+    npc_dist = Utils.Distance((player_x, player_y), (npc_x, npc_y))
+    
+    # Move closer if needed
+    if npc_dist > 100:
+        Player.Move(npc_x, npc_y)
+        return
+    
+    # Close enough, interact if not already in dialog
+    if not is_npc_dialog_visible():
+        if point not in FSM_vars.blessing_interact_logged:
+            ConsoleLog("Blessing", f"Interacting with NPC (model ID: {npc_model_id}) to acquire blessing", Console.MessageType.Info)
+            FSM_vars.blessing_interact_logged.add(point)
+        Player.Interact(npc_agent)
+        FSM_vars.blessing_dialog_wait_time = time.time()
+        return
+    
+    # Dialog is visible, click button once and wait
+    elapsed = time.time() - FSM_vars.blessing_dialog_wait_time
+    
+    # If dialog is still open after 5+ seconds with no blessing, try clicking again
+    if is_npc_dialog_visible() and elapsed > 5.0:
+        ConsoleLog("Blessing", f"Sending blessing confirmation", Console.MessageType.Warning)
+        click_dialog_button(1)
+        return
 
 class FollowPathAndAggro:
     def __init__(self, path_handler, follow_handler, aggro_range=2500, log_actions=False):
@@ -422,6 +503,48 @@ def resume_all(debug: bool = False):
 
     FSM_vars.movement_handler.resume()
 
+
+def _handle_initial_blessing_state():
+    """Handle initial blessing acquisition when entering explorable"""
+    if has_any_blessing(Player.GetAgentID()):
+        return  # Already have blessing
+    
+    # Check if we have a blessing point defined
+    if FSM_vars.blessing_points:
+        # Find the closest blessing point we haven't tried yet and trigger it
+        for point in FSM_vars.blessing_points:
+            if point not in FSM_vars.blessing_triggered:
+                trigger_blessing_at(point)
+                break
+
+def _should_exit_blessing_state():
+    """Determine if we should exit the Initial Auto-Blessing state"""
+    # Exit if we have a blessing
+    if has_any_blessing(Player.GetAgentID()):
+        ConsoleLog("Blessing", "Blessing acquired, moving to combat", Console.MessageType.Info)
+        return True
+    
+    # Exit if map is loading
+    if Map.IsMapLoading():
+        return True
+    
+    # Exit if all blessing points have been tried and none succeeded
+    if FSM_vars.blessing_points:
+        all_tried = all(point in FSM_vars.blessing_triggered for point in FSM_vars.blessing_points)
+        if all_tried:
+            ConsoleLog("Blessing", "All blessing points tried, moving to combat without blessing", Console.MessageType.Warning)
+            return True
+    
+    # Otherwise, stay in blessing state
+    return False
+
+
+def _start_combat_phase():
+    """Re-enable HeroAI and start combat phase"""
+    whandler.enable_widget("HeroAI")
+    return FSM_vars.path_and_aggro.update()
+
+
 # Modify InitializeStateMachine
 def InitializeStateMachine():
     # Combat FSM setup
@@ -456,7 +579,7 @@ def InitializeStateMachine():
     FSM_vars.state_machine.AddState(
         name="Check Current Map",
         execute_fn= lambda: Routines.Transition.TravelToOutpost(bot_vars.starting_map),
-        exit_condition= lambda: Routines.Transition.HasArrivedToOutpost(bot_vars.starting_map),
+        exit_condition=lambda: Map.GetMapID() == bot_vars.starting_map and not Map.IsMapLoading(),
         transition_delay_ms=1000
     )
     FSM_vars.state_machine.AddState(
@@ -477,19 +600,20 @@ def InitializeStateMachine():
     )
     FSM_vars.state_machine.AddState(
         name="Wait For Explorable Load",
+        execute_fn=lambda: whandler.disable_widget("HeroAI"),
         exit_condition=lambda: not Map.IsMapLoading() and Map.IsExplorable(),
         transition_delay_ms=1000
     )
     FSM_vars.state_machine.AddState(
         name="Initial Auto-Blessing",
-        execute_fn=lambda: blessed and blessed.module.Get_Blessed(),
-        exit_condition=lambda: has_any_blessing(Player.GetAgentID()) or Map.IsMapLoading() or (get_blessing_npc()[0] is None),
-        transition_delay_ms=5000,
-        run_once=True
+        execute_fn=lambda: _handle_initial_blessing_state(),
+        exit_condition=lambda: _should_exit_blessing_state(),
+        transition_delay_ms=500,
+        run_once=False
     )
     FSM_vars.state_machine.AddState(
         name="Combat and Movement",
-        execute_fn=lambda: FSM_vars.path_and_aggro.update(),
+        execute_fn=lambda: _start_combat_phase(),
         exit_condition=lambda: Routines.Movement.IsFollowPathFinished(FSM_vars.explorable_pathing, FSM_vars.movement_handler),
         run_once=False
     )
@@ -498,7 +622,9 @@ def ResetEnvironment():
     FSM_vars.outpost_pathing.reset()
     FSM_vars.explorable_pathing.reset()
     FSM_vars.blessing_triggered.clear()
+    FSM_vars.blessing_interact_logged.clear()
     FSM_vars.blessing_timers.clear()
+    FSM_vars.blessing_dialog_wait_time = 0.0
     FSM_vars.movement_handler.reset()
     if bot_vars.combat_started:
         stop_combat()
@@ -760,6 +886,7 @@ def main():
         if not bot_vars.pause_combat_fsm:
             FSM_vars.global_combat_fsm.update()
         FSM_vars.state_machine.update()
+
         
     except Exception as e:
         ConsoleLog(module_name, f"Error in main: {str(e)}", Console.MessageType.Error)
@@ -768,14 +895,21 @@ def main():
 def StartBot():
     global bot_vars, FSM_vars
     
+    # Reset the Transition timer to allow fresh travel calls
+    from Py4GWCoreLib.routines_src.Transition import arrived_timer
+    if not arrived_timer.IsStopped():
+        arrived_timer.Stop()
+    
     # First initialize state machines if needed
     if FSM_vars.state_machine.get_state_count() == 0:
         InitializeStateMachine()
     
     # Then reset all variables and states
-    FSM_vars.has_blessing = False
-    FSM_vars.in_blessing_dialog = False
-    FSM_vars.blessing_timer.Stop()
+    FSM_vars.current_blessing_npc = None
+    FSM_vars.blessing_dialog_wait_time = 0.0
+    FSM_vars.blessing_triggered.clear()
+    FSM_vars.blessing_interact_logged.clear()
+    FSM_vars.blessing_timers.clear()
     FSM_vars.movement_handler.reset()
     FSM_vars.outpost_pathing.reset()
     FSM_vars.explorable_pathing.reset()
