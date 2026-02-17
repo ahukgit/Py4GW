@@ -12,6 +12,7 @@ import importlib.util
 from typing import Optional
 from Sources.aC_Scripts.aC_api.Blessing_dialog_helper import is_npc_dialog_visible, click_dialog_button
 from Sources.aC_Scripts.aC_api.Blessing_Core import BlessingNpc
+from Sources.aC_Scripts.aC_api import BlessingRunner, has_any_blessing
 from Sources.aC_Scripts.aC_api.Titles import (display_faction, display_title_progress,
     sunspear_tiers, lightbringer_tiers, kurzick_tiers, luxon_tiers,
     luxon_regions, kurzick_regions, nightfall_regions, eotn_region_titles
@@ -62,13 +63,10 @@ class FSMVars:
         self.current_skill = 1
         self.blessing_points = []
         self.blessing_triggered = set()
-        self.blessing_timers = {}
-        self.blessing_interact_logged = set()
-        self.current_blessing_npc: Optional[int] = None
-        self.blessing_dialog_wait_time = 0.0
-        self.blessing_click_count = {}
-        self.blessing_state_start_time: Optional[float] = None
-        self.blessing_interaction_attempted = set()
+        self.blessing_attempted_locations = set()  # Track locations we've tried
+        self.blessing_runner = BlessingRunner()
+        self.blessing_runner_active = False
+        self.blessing_phase_start_time: Optional[float] = None
 
 class BotVars:
     def __init__(self):
@@ -97,7 +95,7 @@ class BotVars:
         self.map_data = {}
 
 def trigger_blessing_at(point):
-    """Move to blessing coordinates and acquire the blessing with dialog"""
+    """Move to blessing coordinates and acquire blessing using BlessingRunner"""
     if point in FSM_vars.blessing_triggered:
         return
     
@@ -110,175 +108,86 @@ def trigger_blessing_at(point):
         Player.Move(bx, by)
         return
     
-    # We're close to the blessing point now, initialize on first approach
-    if point not in FSM_vars.blessing_timers:
-        ConsoleLog("Blessing", f"Reached blessing point {point}, searching for NPC...", Console.MessageType.Info)
-        FSM_vars.blessing_timers[point] = time.time()
-        FSM_vars.current_blessing_npc = None
-        return
-
-    # Now find the closest BLESSING NPC nearby
-    if FSM_vars.current_blessing_npc is None:
-        px, py = Player.GetXY()
-        closest_npc = None
-        closest_dist = float('inf')
-        
-        # Build a set of all valid blessing NPC model IDs
+    # We're close to the blessing point, look for NPCs specifically near this point
+    if not FSM_vars.blessing_runner_active:
+        # Check for blessing NPCs near this specific point (within 600 units)
         valid_blessing_models = set()
         for npc_type in BlessingNpc:
             valid_blessing_models.update(npc_type.model_ids)
         
+        found_npc = None
         for ag in AgentArray.GetAgentArray():
             try:
                 ax, ay = Agent.GetXY(ag)
-                dist = Utils.Distance((px, py), (ax, ay))
-                # Skip self (player)
-                if dist == 0:
-                    continue
-                # Only pick blessing NPCs within 500 units
-                model_id = Agent.GetModelID(ag)
-                if model_id in valid_blessing_models and dist < 500 and dist < closest_dist:
-                    closest_npc = ag
-                    closest_dist = dist
+                # Check if NPC is near the blessing point (not just near player)
+                dist_from_point = Utils.Distance((ax, ay), (bx, by))
+                if dist_from_point < 600:  # NPC is near the blessing point
+                    model_id = Agent.GetModelID(ag)
+                    if model_id in valid_blessing_models:
+                        # Check if we've already tried this location
+                        npc_location = (int(ax), int(ay))
+                        already_attempted = any(
+                            Utils.Distance(npc_location, attempted_loc) < 100 
+                            for attempted_loc in FSM_vars.blessing_attempted_locations
+                        )
+                        if not already_attempted:
+                            found_npc = ag
+                            FSM_vars.blessing_attempted_locations.add(npc_location)
+                            break
             except:
                 continue
         
-        if closest_npc is not None:
-            ConsoleLog("Blessing", f"Found NPC (model ID: {Agent.GetModelID(closest_npc)}) at distance {closest_dist:.0f}", Console.MessageType.Info)
-            FSM_vars.current_blessing_npc = closest_npc
-        elif time.time() - FSM_vars.blessing_timers[point] > 10.0:
-            ConsoleLog("Blessing", f"Timeout: No NPC found after 10 seconds", Console.MessageType.Warning)
+        if found_npc:
+            ConsoleLog("Blessing", f"Starting BlessingRunner for NPC at point {point}", Console.MessageType.Info)
+            Player.ChangeTarget(found_npc)  # Target the specific NPC we found
+            FSM_vars.blessing_runner.start()
+            FSM_vars.blessing_runner_active = True
+        else:
+            # No valid NPC found at this point, mark as complete
+            ConsoleLog("Blessing", f"No valid blessing NPC found at point {point}, skipping", Console.MessageType.Warning)
             FSM_vars.blessing_triggered.add(point)
         return
     
-    # We have an NPC, move to it and interact
-    npc_agent = FSM_vars.current_blessing_npc
-
-    # Disable HeroAI to prevent interference with dialog
-    whandler.disable_widget("HeroAI")
+    # BlessingRunner is active, update it
+    done, success = FSM_vars.blessing_runner.update()
     
-    try:
-        npc_x, npc_y = Agent.GetXY(npc_agent)
-        npc_model_id = Agent.GetModelID(npc_agent)
-    except:
-        FSM_vars.current_blessing_npc = None
-        return
-    
-    player_x, player_y = Player.GetXY()
-    npc_dist = Utils.Distance((player_x, player_y), (npc_x, npc_y))
-    
-    # Move closer if needed
-    if npc_dist > 100:
-        Player.Move(npc_x, npc_y)
-        return
-    
-    # Close enough, interact if not already in dialog
-    if not is_npc_dialog_visible():
-        # Allow interaction if we haven't tried recently (prevent spam but allow retries)
-        if point not in FSM_vars.blessing_interaction_attempted or (
-            FSM_vars.blessing_dialog_wait_time > 0 and 
-            time.time() - FSM_vars.blessing_dialog_wait_time > 5.0
-        ):
-            if point not in FSM_vars.blessing_interact_logged:
-                ConsoleLog("Blessing", f"Interacting with NPC (model ID: {npc_model_id}) to acquire blessing", Console.MessageType.Info)
-                FSM_vars.blessing_interact_logged.add(point)
-            Player.Interact(npc_agent)
-            FSM_vars.blessing_dialog_wait_time = time.time()
-            FSM_vars.blessing_interaction_attempted.add(point)  # Mark as attempted
-        return
-    
-    # Dialog is visible, handle blessing confirmation with proper timing and limits
-    elapsed = time.time() - FSM_vars.blessing_dialog_wait_time
-    
-    # Check if dialog closed first (success case) - give more time for dialog to appear first
-    if elapsed > 2.0 and not is_npc_dialog_visible():
-        ConsoleLog("Blessing", f"Blessing dialog closed, acquisition complete", Console.MessageType.Success)
-        FSM_vars.blessing_triggered.add(point)
-        FSM_vars.current_blessing_npc = None
-        FSM_vars.blessing_dialog_wait_time = 0.0
-        FSM_vars.blessing_interaction_attempted.discard(point)  # Allow future interactions at this point
-        # Re-enable HeroAI after blessing completion
-        whandler.enable_widget("HeroAI")
-        return
-    
-    # Initialize click count for this point
-    if point not in FSM_vars.blessing_click_count:
-        FSM_vars.blessing_click_count[point] = 0
-    
-    # Try clicking if we haven't reached max attempts and enough time has passed
-    if elapsed > 2.0 and FSM_vars.blessing_click_count[point] < 3:
-        ConsoleLog("Blessing", f"Clicking dialog button to confirm blessing (attempt {FSM_vars.blessing_click_count[point] + 1})", Console.MessageType.Info)
-        click_dialog_button(1)
-        FSM_vars.blessing_click_count[point] += 1
-        FSM_vars.blessing_dialog_wait_time = time.time()  # Reset timer for next attempt
-        return
-    
-    # Timeout after reasonable attempts or time
-    if elapsed > 15.0 or FSM_vars.blessing_click_count[point] >= 3:
-        # One final check if dialog closed before giving up
-        if not is_npc_dialog_visible():
-            ConsoleLog("Blessing", f"Blessing dialog closed after timeout check, acquisition complete", Console.MessageType.Success)
+    if done:
+        FSM_vars.blessing_runner_active = False
+        if success:
+            ConsoleLog("Blessing", f"Successfully acquired blessing at point {point}", Console.MessageType.Success)
         else:
-            ConsoleLog("Blessing", f"Dialog timeout or max attempts reached, marking shrine complete", Console.MessageType.Warning)
+            ConsoleLog("Blessing", f"Failed to acquire blessing at point {point}", Console.MessageType.Warning)
         FSM_vars.blessing_triggered.add(point)
-        FSM_vars.current_blessing_npc = None
-        FSM_vars.blessing_dialog_wait_time = 0.0
-        FSM_vars.blessing_interaction_attempted.discard(point)  # Allow future interactions at this point
-        # Re-enable HeroAI after blessing timeout
-        whandler.enable_widget("HeroAI")
-        return
 
 def detect_nearby_blessing_shrine():
-    """Detect if there's a blessing shrine nearby and attempt to get blessing"""
-    px, py = Player.GetXY()
+    """Use Blessing_Core to detect and acquire blessings from any nearby NPCs (for dynamic detection)"""
+    # Skip if BlessingRunner is already active
+    if FSM_vars.blessing_runner_active:
+        return False
     
-    # Build a set of all valid blessing NPC model IDs
-    valid_blessing_models = set()
-    for npc_type in BlessingNpc:
-        valid_blessing_models.update(npc_type.model_ids)
+    # Let Blessing_Core find the appropriate NPC - but check if we've already tried it
+    from Sources.aC_Scripts.aC_api.Blessing_Core import get_blessing_npc
+    npc_type, npc_agent = get_blessing_npc()
     
-    # Find nearest blessing NPC within range
-    nearest_npc = None
-    nearest_dist = float('inf')
-    
-    for ag in AgentArray.GetAgentArray():
+    if npc_agent:
+        # Check if we've already attempted this NPC location
         try:
-            ax, ay = Agent.GetXY(ag)
-            dist = Utils.Distance((px, py), (ax, ay))
-            # Skip self (player)
-            if dist == 0:
-                continue
-            # Look for blessing NPCs within 800 units
-            model_id = Agent.GetModelID(ag)
-            if model_id in valid_blessing_models and dist < 800 and dist < nearest_dist:
-                nearest_npc = ag
-                nearest_dist = dist
+            ax, ay = Agent.GetXY(npc_agent)
+            npc_location = (int(ax), int(ay))
+            already_attempted = any(
+                Utils.Distance(npc_location, attempted_loc) < 100 
+                for attempted_loc in FSM_vars.blessing_attempted_locations
+            )
+            
+            if not already_attempted:
+                # Found a new blessing NPC, use BlessingRunner to get the blessing
+                ConsoleLog("Blessing", f"Found nearby {npc_type.name if npc_type else 'Unknown'} blessing NPC", Console.MessageType.Info)
+                FSM_vars.blessing_attempted_locations.add(npc_location)
+                FSM_vars.blessing_runner.start()
+                FSM_vars.blessing_runner_active = True
+                return True
         except:
-            continue
-    
-    if nearest_npc is not None:
-        # Create a dynamic blessing point at the NPC's location
-        npc_x, npc_y = Agent.GetXY(nearest_npc)
-        blessing_point = (int(npc_x), int(npc_y))
-        
-        # Check if this shrine location is already known (within 100 units of existing points)
-        known_point = None
-        for existing_point in FSM_vars.blessing_points:
-            if Utils.Distance(blessing_point, existing_point) < 100:
-                known_point = existing_point
-                break
-        
-        # Use existing point if found, otherwise add new one
-        if known_point:
-            blessing_point = known_point
-        else:
-            FSM_vars.blessing_points.append(blessing_point)
-            ConsoleLog("Blessing", f"Found nearby shrine at {blessing_point}, distance: {nearest_dist:.0f}", Console.MessageType.Info)
-        
-        # Only try to get the blessing if we haven't already tried this shrine
-        if blessing_point not in FSM_vars.blessing_triggered:
-            trigger_blessing_at(blessing_point)
-            return True
+            pass
     
     return False
 
@@ -594,52 +503,15 @@ def resume_all(debug: bool = False):
 
 def _handle_initial_blessing_state():
     """Handle initial blessing acquisition when entering explorable"""
-    # If we have predefined blessing points, always go to the first one
+    # If we have predefined blessing points, go to them first
     if FSM_vars.blessing_points:
-        first_point = FSM_vars.blessing_points[0]
-        if first_point not in FSM_vars.blessing_triggered:
-            # Always trigger the first blessing point - trigger_blessing_at handles movement
-            trigger_blessing_at(first_point)
-            return
+        for point in FSM_vars.blessing_points:
+            if point not in FSM_vars.blessing_triggered:
+                trigger_blessing_at(point)
+                return
     
-    # If no predefined points, try automatic detection nearby
-    px, py = Player.GetXY()
-    
-    # Build a set of all valid blessing NPC model IDs
-    valid_blessing_models = set()
-    for npc_type in BlessingNpc:
-        valid_blessing_models.update(npc_type.model_ids)
-    
-    # Find nearest blessing NPC within reasonable range for initial blessing
-    nearest_npc = None
-    nearest_dist = float('inf')
-    
-    for ag in AgentArray.GetAgentArray():
-        try:
-            ax, ay = Agent.GetXY(ag)
-            dist = Utils.Distance((px, py), (ax, ay))
-            if dist == 0:
-                continue
-            # Look for blessing NPCs within 800 units
-            model_id = Agent.GetModelID(ag)
-            if model_id in valid_blessing_models and dist < 800 and dist < nearest_dist:
-                nearest_npc = ag
-                nearest_dist = dist
-        except:
-            continue
-    
-    if nearest_npc is not None:
-        npc_x, npc_y = Agent.GetXY(nearest_npc)
-        blessing_point = (int(npc_x), int(npc_y))
-        
-        # Add to blessing points if not already there
-        if blessing_point not in FSM_vars.blessing_points:
-            FSM_vars.blessing_points.insert(0, blessing_point)  # Add as first blessing
-            ConsoleLog("Blessing", f"Found initial shrine at {blessing_point}, distance: {nearest_dist:.0f}", Console.MessageType.Info)
-        
-        # Try to get this blessing
-        if blessing_point not in FSM_vars.blessing_triggered:
-            trigger_blessing_at(blessing_point)
+    # No predefined points or all completed, try automatic detection
+    detect_nearby_blessing_shrine()
 
 def _should_exit_blessing_state():
     """Determine if we should exit the Initial Auto-Blessing state"""
@@ -647,24 +519,31 @@ def _should_exit_blessing_state():
     if Map.IsMapLoading():
         return True
     
-    # Exit after getting first blessing or reasonable timeout for initial blessing phase
-    if FSM_vars.blessing_points:
-        # Check if we got the first blessing point (most common case)
-        first_point = FSM_vars.blessing_points[0]
-        if first_point in FSM_vars.blessing_triggered:
-            ConsoleLog("Blessing", "Initial blessing acquired, moving to combat", Console.MessageType.Info)
-            return True
-    
-    # Exit after reasonable time if no initial blessing acquired
-    if FSM_vars.blessing_state_start_time is None:
-        FSM_vars.blessing_state_start_time = time.time()
+    # Start timing if not already started
+    if FSM_vars.blessing_phase_start_time is None:
+        FSM_vars.blessing_phase_start_time = time.time()
         return False
     
-    if time.time() - FSM_vars.blessing_state_start_time > 20.0:  # 20 second timeout for initial blessing
-        ConsoleLog("Blessing", "Initial blessing phase complete after 20 seconds, moving to combat", Console.MessageType.Info)
+    elapsed = time.time() - FSM_vars.blessing_phase_start_time
+    
+    # Continue trying to find more blessings until timeout
+    # BlessingRunner will naturally stop finding NPCs when all nearby ones are exhausted
+    if not FSM_vars.blessing_runner_active:
+        # Try to find another blessing NPC
+        if not detect_nearby_blessing_shrine():
+            # No more NPCs found - exit if we have at least one blessing or after reasonable time
+            if has_any_blessing(Player.GetAgentID()) or elapsed > 20.0:
+                blessing_status = "with blessing(s)" if has_any_blessing(Player.GetAgentID()) else "after timeout"
+                ConsoleLog("Blessing", f"Blessing collection complete {blessing_status}, moving to combat", Console.MessageType.Info)
+                return True
+    
+    # Exit after maximum time (30 seconds total)
+    if elapsed > 30.0:
+        blessing_status = "with blessing(s)" if has_any_blessing(Player.GetAgentID()) else "after timeout"
+        ConsoleLog("Blessing", f"Blessing phase complete {blessing_status}, moving to combat", Console.MessageType.Info)
         return True
     
-    # Otherwise, stay in blessing state
+    # Continue blessing collection
     return False
 
 
@@ -751,13 +630,9 @@ def ResetEnvironment():
     FSM_vars.outpost_pathing.reset()
     FSM_vars.explorable_pathing.reset()
     FSM_vars.blessing_triggered.clear()
-    FSM_vars.blessing_interact_logged.clear()
-    FSM_vars.blessing_interaction_attempted.clear()
-    FSM_vars.blessing_timers.clear()
-    FSM_vars.blessing_click_count.clear()
-    FSM_vars.blessing_dialog_wait_time = 0.0
-    FSM_vars.current_blessing_npc = None
-    FSM_vars.blessing_state_start_time = None
+    FSM_vars.blessing_attempted_locations.clear()
+    FSM_vars.blessing_runner_active = False
+    FSM_vars.blessing_phase_start_time = None
     FSM_vars.movement_handler.reset()
     if bot_vars.combat_started:
         stop_combat()
@@ -1038,14 +913,10 @@ def StartBot():
         InitializeStateMachine()
     
     # Then reset all variables and states
-    FSM_vars.current_blessing_npc = None
-    FSM_vars.blessing_dialog_wait_time = 0.0
-    FSM_vars.blessing_state_start_time = None
     FSM_vars.blessing_triggered.clear()
-    FSM_vars.blessing_interact_logged.clear()
-    FSM_vars.blessing_interaction_attempted.clear()
-    FSM_vars.blessing_timers.clear()
-    FSM_vars.blessing_click_count.clear()
+    FSM_vars.blessing_attempted_locations.clear()
+    FSM_vars.blessing_runner_active = False
+    FSM_vars.blessing_phase_start_time = None
     FSM_vars.movement_handler.reset()
     FSM_vars.outpost_pathing.reset()
     FSM_vars.explorable_pathing.reset()
