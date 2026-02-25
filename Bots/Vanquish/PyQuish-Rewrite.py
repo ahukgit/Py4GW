@@ -52,6 +52,13 @@ _scanner_resume_suppress_ts: list[int] = [0]                 # timestamp of resu
 SCANNER_RESUME_SUPPRESS_TIMEOUT_MS = 600000  # 10-minute safety-net timeout
 SCANNER_RESUME_CLEAR_DISTANCE = 300          # clear suppress when player is this close to target waypoint
 
+# Stuck detection during suppress window: if the player hasn't made meaningful
+# progress toward the target waypoint for this long, skip to the next one.
+_scanner_suppress_best_dist: list[float] = [float('inf')]    # best (closest) distance seen this suppress
+_scanner_suppress_last_improve_ts: list[int] = [0]           # timestamp of last distance improvement
+SCANNER_SUPPRESS_STUCK_TIMEOUT_MS = 60000        # 60s without progress = stuck
+SCANNER_SUPPRESS_STUCK_IMPROVEMENT = 200         # must close by this many units to count as progress
+
 # ============================================================================
 # Bot Routine
 # ============================================================================
@@ -326,6 +333,8 @@ SCANNER_RESCAN_DELAY = 5000  # Delay between scans (5s)
 SCANNER_POST_GROUP_DELAY = 5000  # Delay after clearing group (5s for loot)
 SCANNER_POST_COMBAT_DELAY = 3000  # Delay after FSM combat finishes (3s)
 SCANNER_PULL_RETRY_COUNT = 3  # Direct pull attempts if party doesn't auto-engage
+SCANNER_MAX_COMBAT_WAIT_MS = 180000  # Max time to wait for a combat group to clear (3 min)
+SCANNER_FAILED_POSITION_RADIUS = 800  # Radius around a failed enemy position to skip other enemies
 
 
 def _get_enemies_in_range(position, range_value=Range.Compass.value, alive_only=True, aggressive_only=False):
@@ -353,28 +362,37 @@ def _get_enemies_in_range(position, range_value=Range.Compass.value, alive_only=
     return enemies
 
 
-def _wait_for_combat_clear(confirmation_time):
+def _wait_for_combat_clear(confirmation_time, max_wait_ms=None):
     """
     Coroutine to wait until no aggressive enemies remain in compass range.
     Uses confirmation timer to ensure combat is truly finished before continuing.
-    
+
     Args:
         confirmation_time: Duration in milliseconds to confirm no enemies remain
+        max_wait_ms: Optional hard timeout; if set, stop waiting after this many ms
+                     even if enemies are still aggressive (bugged/unreachable enemy)
     """
     clear_timer = Timer()
+    max_timer = Timer()
     clear_started = False
-    
+    if max_wait_ms is not None:
+        max_timer.Start()
+
     while True:
         yield from Routines.Yield.wait(1000)
-        
+
+        if max_wait_ms is not None and max_timer.HasElapsed(max_wait_ms):
+            ConsoleLog("Scanner", f"Combat timeout ({max_wait_ms // 1000}s) - giving up on waiting for clear")
+            break
+
         player_pos = Player.GetXY()
         aggressive_enemies = _get_enemies_in_range(player_pos, aggressive_only=True)
-        
+
         if len(aggressive_enemies) == 0:
             if not clear_started:
                 clear_timer.Start()
                 clear_started = True
-            
+
             if clear_timer.HasElapsed(confirmation_time):
                 break
         else:
@@ -386,7 +404,12 @@ def _enemy_scanner_coroutine(bot: Botting):
     Background coroutine that scans for nearby enemies and ensures combat engagement.
     Helps achieve 100% vanquish by detecting enemies that might be skipped.
     """
-    
+    # Persists across scanner activations for the entire map run.
+    # Entries evict naturally when enemies die (alive_only filter in _get_enemies_in_range).
+    failed_enemy_ids: set = set()
+    # Positions of unreachable enemies — used to skip other agents clustered in the same spot.
+    failed_positions: list[tuple[float, float]] = []
+
     while True:
         # Only scan when in explorable area
         if not Routines.Checks.Map.IsExplorable():
@@ -406,6 +429,8 @@ def _enemy_scanner_coroutine(bot: Botting):
             # party-wipe infinite loop. Just resume so can_exit() fires naturally.
             _scanner_resume_suppress_state[0] = fsm.current_state.name if fsm.current_state else None
             _scanner_resume_suppress_ts[0] = Utils.GetBaseTimestamp()
+            _scanner_suppress_best_dist[0] = float('inf')
+            _scanner_suppress_last_improve_ts[0] = Utils.GetBaseTimestamp()
             fsm.resume()
             yield from Routines.Yield.wait(1000)
             continue
@@ -462,6 +487,37 @@ def _enemy_scanner_coroutine(bot: Botting):
                             ConsoleLog("Scanner", f"Player within {dist_to_wp:.0f} units of target waypoint '{sname}' - re-enabling enemy scanning.")
                             _scanner_resume_suppress_state[0] = None
                             suppress_cleared = True
+                            break
+
+                        # Update best-distance tracker for stuck detection.
+                        if dist_to_wp < _scanner_suppress_best_dist[0] - SCANNER_SUPPRESS_STUCK_IMPROVEMENT:
+                            _scanner_suppress_best_dist[0] = dist_to_wp
+                            _scanner_suppress_last_improve_ts[0] = Utils.GetBaseTimestamp()
+
+                        # Detect stuck: no meaningful progress for SCANNER_SUPPRESS_STUCK_TIMEOUT_MS.
+                        stuck_for = Utils.GetBaseTimestamp() - _scanner_suppress_last_improve_ts[0]
+                        if _scanner_suppress_last_improve_ts[0] > 0 and stuck_for >= SCANNER_SUPPRESS_STUCK_TIMEOUT_MS:
+                            ConsoleLog("Scanner", f"Player stuck {dist_to_wp:.0f} units from '{sname}' for {stuck_for // 1000}s - skipping to next waypoint")
+                            # Find this waypoint's index in waypoint_states, then jump to the next one.
+                            wp_idx = next((i for i, (wn, _, _) in enumerate(bot_vars.waypoint_states) if wn == sname), None)
+                            next_wp_name: str | None = None
+                            if wp_idx is not None and wp_idx + 1 < len(bot_vars.waypoint_states):
+                                next_wp_name = bot_vars.waypoint_states[wp_idx + 1][0]
+                            if next_wp_name:
+                                ConsoleLog("Scanner", f"Jumping to next waypoint '{next_wp_name}'")
+                                try:
+                                    fsm.jump_to_state_by_name(next_wp_name)
+                                    _scanner_resume_suppress_state[0] = next_wp_name
+                                    _scanner_resume_suppress_ts[0] = Utils.GetBaseTimestamp()
+                                    _scanner_suppress_best_dist[0] = float('inf')
+                                    _scanner_suppress_last_improve_ts[0] = Utils.GetBaseTimestamp()
+                                except ValueError as jump_err:
+                                    ConsoleLog("Scanner", f"Jump failed: {jump_err} - clearing suppress")
+                                    _scanner_resume_suppress_state[0] = None
+                            else:
+                                ConsoleLog("Scanner", "No next waypoint found - clearing suppress")
+                                _scanner_resume_suppress_state[0] = None
+                            suppress_cleared = True
                         break
                 if not suppress_cleared:
                     yield from Routines.Yield.wait(1000)
@@ -486,7 +542,7 @@ def _enemy_scanner_coroutine(bot: Botting):
         # If party is already fighting, wait for combat to finish first
         if len(aggressive_enemies) > 0:
             ConsoleLog("Scanner", f"Found {len(unaggred_enemies)} unaggred enemies but party is fighting {len(aggressive_enemies)} enemies - waiting...")
-            yield from _wait_for_combat_clear(SCANNER_COMBAT_CLEAR_CONFIRMATION_TIME)
+            yield from _wait_for_combat_clear(SCANNER_COMBAT_CLEAR_CONFIRMATION_TIME, max_wait_ms=SCANNER_MAX_COMBAT_WAIT_MS)
             ConsoleLog("Scanner", "Current combat finished, now scanning for missed enemies...")
             yield from Routines.Yield.wait(SCANNER_POST_COMBAT_DELAY)
             continue
@@ -506,13 +562,25 @@ def _enemy_scanner_coroutine(bot: Botting):
         
         # Engage each group until all unaggred enemies are cleared
         consecutive_skips = 0  # track how many targets in a row were skipped without engaging
+        consecutive_movement_timeouts = 0  # track movement timeouts specifically (truly unreachable enemies)
         while True:
-            # Refresh enemy list
+            # Refresh enemy list, excluding known unreachable enemies (by ID or position cluster)
             player_pos = Player.GetXY()
-            unaggred_enemies = [e for e in _get_enemies_in_range(player_pos) if not Agent.IsAggressive(e)]
+            def _is_near_failed_pos(eid):
+                epos = Agent.GetXY(eid)
+                if not epos:
+                    return False
+                return any(Utils.Distance(epos, fp) < SCANNER_FAILED_POSITION_RADIUS for fp in failed_positions)
+            unaggred_enemies = [e for e in _get_enemies_in_range(player_pos)
+                                if not Agent.IsAggressive(e)
+                                and e not in failed_enemy_ids
+                                and not _is_near_failed_pos(e)]
             
             if len(unaggred_enemies) == 0:
-                ConsoleLog("Scanner", "All enemy groups engaged")
+                if failed_enemy_ids:
+                    ConsoleLog("Scanner", f"All enemy groups engaged or unreachable ({len(failed_enemy_ids)} enemies blacklisted)")
+                else:
+                    ConsoleLog("Scanner", "All enemy groups engaged")
                 break
 
             # If we've skipped too many targets in a row the heroes are already
@@ -520,9 +588,16 @@ def _enemy_scanner_coroutine(bot: Botting):
             # rather than chasing targets endlessly.
             if consecutive_skips >= 4:
                 ConsoleLog("Scanner", "Too many consecutive skips - waiting for current combat to settle...")
-                yield from _wait_for_combat_clear(SCANNER_CLEAR_CONFIRMATION_TIME)
+                yield from _wait_for_combat_clear(SCANNER_CLEAR_CONFIRMATION_TIME, max_wait_ms=SCANNER_MAX_COMBAT_WAIT_MS)
                 consecutive_skips = 0
                 continue
+
+            # If we've had multiple movement timeouts in a row with no successful
+            # engagement in between, the remaining enemies are truly unreachable from
+            # this position - resume the main path rather than looping forever.
+            if consecutive_movement_timeouts >= 3:
+                ConsoleLog("Scanner", f"{consecutive_movement_timeouts} consecutive movement timeouts - remaining enemies unreachable, resuming main path")
+                break
             
             # Target nearest unaggred enemy
             unaggred_enemies = AgentArray.Sort.ByDistance(unaggred_enemies, player_pos)
@@ -535,7 +610,7 @@ def _enemy_scanner_coroutine(bot: Botting):
             # does NOT count - this only fires if something is in the player's face.
             if _get_enemies_in_range(Player.GetXY(), Range.Earshot.value, aggressive_only=True):
                 ConsoleLog("Scanner", "Enemies attacking player - waiting for combat to clear before moving to next group...")
-                yield from _wait_for_combat_clear(SCANNER_CLEAR_CONFIRMATION_TIME)
+                yield from _wait_for_combat_clear(SCANNER_CLEAR_CONFIRMATION_TIME, max_wait_ms=SCANNER_MAX_COMBAT_WAIT_MS)
                 consecutive_skips = 0
                 continue
             
@@ -571,19 +646,25 @@ def _enemy_scanner_coroutine(bot: Botting):
                 
                 yield from Routines.Yield.wait(500)
             else:
-                # Movement timeout - skip this enemy
+                # Movement timeout - enemy is likely unreachable, blacklist it by ID and position
+                ConsoleLog("Scanner", f"Movement timeout reaching enemy at ({enemy_pos[0]:.0f}, {enemy_pos[1]:.0f}) - blacklisting as unreachable")
+                failed_enemy_ids.add(nearest_enemy)
+                failed_positions.append(enemy_pos)
                 consecutive_skips += 1
+                consecutive_movement_timeouts += 1
                 continue
 
             # Skip if enemy was already killed/engaged
             if skipped or not Agent.IsAlive(nearest_enemy) or Agent.IsAggressive(nearest_enemy):
                 consecutive_skips += 1
+                # Do NOT increment consecutive_movement_timeouts here - heroes killing
+                # enemies before the player arrives is normal and should not trigger
+                # the unreachable-enemy early exit.
                 yield from Routines.Yield.wait(500)
                 continue
             
             consecutive_skips = 0
-            
-            # Wait for party to engage
+            consecutive_movement_timeouts = 0  # successful engagement resets timeout counter
             ConsoleLog("Scanner", "Reached enemy position, waiting for party to engage...")
             
             engage_timer = Timer()
@@ -611,7 +692,9 @@ def _enemy_scanner_coroutine(bot: Botting):
                         break
 
                 if not pull_succeeded:
-                    ConsoleLog("Scanner", "Enemies still didn't aggro after pull attempts, moving to next group...")
+                    ConsoleLog("Scanner", f"Enemies still didn't aggro after pull attempts - blacklisting enemy at ({enemy_pos[0]:.0f}, {enemy_pos[1]:.0f})")
+                    failed_enemy_ids.add(nearest_enemy)
+                    failed_positions.append(enemy_pos)
                     continue
             
             # Combat started - wait for enemies to aggro
@@ -630,24 +713,32 @@ def _enemy_scanner_coroutine(bot: Botting):
                     ConsoleLog("Scanner", f"Enemies aggroed ({aggressive_count} aggressive), waiting for group to be cleared...")
             
             if not enemies_aggroed:
-                ConsoleLog("Scanner", "Enemies didn't aggro, moving to next group...")
+                ConsoleLog("Scanner", f"Enemies didn't aggro - blacklisting enemy at ({enemy_pos[0]:.0f}, {enemy_pos[1]:.0f})")
+                failed_enemy_ids.add(nearest_enemy)
+                failed_positions.append(enemy_pos)
                 continue
             
-            # Wait for group to be cleared with confirmation
+            # Wait for group to be cleared with confirmation (max timeout guards against bugged enemies)
             clear_timer = Timer()
+            max_combat_timer = Timer()
             clear_started = False
-            
+            max_combat_timer.Start()
+
             while True:
                 yield from Routines.Yield.wait(1000)
-                
+
+                if max_combat_timer.HasElapsed(SCANNER_MAX_COMBAT_WAIT_MS):
+                    ConsoleLog("Scanner", f"Combat timeout ({SCANNER_MAX_COMBAT_WAIT_MS // 1000}s) - giving up on this group")
+                    break
+
                 aggressive_enemies = _get_enemies_in_range(Player.GetXY(), aggressive_only=True)
-                
+
                 if len(aggressive_enemies) == 0:
                     if not clear_started:
                         clear_timer.Start()
                         clear_started = True
                         ConsoleLog("Scanner", "No aggressive enemies detected, confirming clear...")
-                    
+
                     if clear_timer.HasElapsed(SCANNER_CLEAR_CONFIRMATION_TIME):
                         ConsoleLog("Scanner", "Group cleared (confirmed)")
                         break
@@ -738,6 +829,8 @@ def _enemy_scanner_coroutine(bot: Botting):
         # Record the current FSM state name for suppress-after-resume.
         _scanner_resume_suppress_state[0] = fsm.current_state.name if fsm.current_state else None
         _scanner_resume_suppress_ts[0] = Utils.GetBaseTimestamp()
+        _scanner_suppress_best_dist[0] = float('inf')
+        _scanner_suppress_last_improve_ts[0] = Utils.GetBaseTimestamp()
         _scanner_has_fsm_control[0] = False
         ConsoleLog("Scanner", f"All enemies in range cleared, resuming main path (suppressing scans until FSM advances from '{_scanner_resume_suppress_state[0]}')...")
         fsm.resume()
