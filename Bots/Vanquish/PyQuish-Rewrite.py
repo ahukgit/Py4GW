@@ -32,6 +32,7 @@ class BotVars:
         self.bless_path_data = []  # List of {"bless": (x,y), "path": [(x,y), ...]} or simple path list
         self.waypoint_states: list[tuple[str, float, float]] = []  # (state_name, x, y) for each XY waypoint in order
         self.use_hero_ai = False  # Whether to enable HeroAI for hero combat management (opt-in)
+        self.use_enemy_scanner = True  # Whether to enable the background enemy scanner (opt-out)
 
 bot_vars = BotVars()
 bot = Botting(BOT_NAME)
@@ -94,12 +95,16 @@ def bot_routine(bot: Botting) -> None:
         ConsoleLog("Bot", "HeroAI enabled")
     bot.Properties.Enable("auto_combat")
     ConsoleLog("Bot", "Player auto-combat enabled (skills + attacks)")
-    # Disable pause_on_danger so FollowPath doesn't self-pause when enemies are
-    # nearby or a party member is dead. The enemy scanner handles all combat
-    # engagement; FollowPath pausing on danger causes permanent deadlocks after
-    # a party wipe because IsPartyMemberDead() stays True during respawn.
-    bot.Properties.Disable("pause_on_danger")
-    ConsoleLog("Bot", "pause_on_danger disabled (scanner handles combat)")
+    if bot_vars.use_enemy_scanner:
+        # Scanner handles all combat engagement; pause_on_danger causes permanent
+        # deadlocks after a party wipe because IsPartyMemberDead() stays True.
+        bot.Properties.Disable("pause_on_danger")
+        ConsoleLog("Bot", "pause_on_danger disabled (scanner handles combat)")
+    else:
+        # No scanner - let the library pause movement on danger so auto_combat
+        # can kill enemies before continuing, same as the Norn title farmer.
+        bot.Properties.Enable("pause_on_danger")
+        ConsoleLog("Bot", "pause_on_danger enabled (scanner disabled, library handles combat pausing)")
     # Disable auto_loot to prevent loot_pause() from halting movement when the
     # player walks through areas with mob drops after combat.
     bot.Properties.Disable("auto_loot")
@@ -127,6 +132,9 @@ def bot_routine(bot: Botting) -> None:
     
     # Helper function to start enemy scanner
     def start_scanner():
+        if not bot_vars.use_enemy_scanner:
+            ConsoleLog("Bot", "Enemy scanner disabled (user setting)")
+            return
         scanner = _enemy_scanner_coroutine(bot)
         bot.config.FSM.AddManagedCoroutine("EnemyScanner", scanner)
         ConsoleLog("Bot", "Enemy scanner active - will detect nearby enemies")
@@ -134,12 +142,23 @@ def bot_routine(bot: Botting) -> None:
     scanner_started = False
 
     def _add_move_xy(x: float, y: float, step_name: str = "") -> None:
-        """Add a vanquish-safe movement waypoint state.
-        uses stop_on_party_wipe=False so GLOBAL_CACHE.Party.IsPartyDefeated(),
-        which stays True for the entire explorable area after any party wipe,
-        does not abort every movement step after the first death.
-        halt_on_death exit_condition still stops movement if the player dies.
+        """Add a movement waypoint state.
+
+        Scanner enabled: custom coroutine using AutoPathing + FollowPath with
+        custom_pause_fn so the scanner owns all pausing decisions.
+
+        Scanner disabled: delegates directly to bot.Move.XY(), identical to the
+        Norn title farmer, letting pause_on_danger handle combat pausing natively.
         """
+        name = step_name or f"MoveTo_{x:.0f}_{y:.0f}"
+
+        if not bot_vars.use_enemy_scanner:
+            # Identical to how the Norn title farmer moves between waypoints.
+            bot.Move.XY(x, y, name)
+            return
+
+        # Scanner-enabled path: AutoPathing coroutine with custom pause so the
+        # scanner (not pause_on_danger) owns all FSM pausing.
         _fsm = bot.config.FSM
 
         def _coro(wx: float = float(x), wy: float = float(y)):
@@ -148,9 +167,8 @@ def bot_routine(bot: Botting) -> None:
             # Compute AutoPath from current position to the waypoint.
             path = yield from AutoPathing().get_path_to(wx, wy)
             bot.config.path = list(path)  # keep config.path updated for UI drawing
-            # Follow path - stop_on_party_wipe=False is the critical flag:
-            # without it, FollowPath returns False on every call after a party wipe
-            # because IsPartyDefeated() is permanently True for the rest of the run.
+            # stop_on_party_wipe=False: without this, FollowPath returns False on
+            # every call after a party wipe because IsPartyDefeated() stays True.
             yield from Routines.Yield.Movement.FollowPath(
                 path_points=list(path),
                 custom_exit_condition=lambda: (
@@ -163,7 +181,6 @@ def bot_routine(bot: Botting) -> None:
                 stop_on_party_wipe=False,
             )
 
-        name = step_name or f"MoveTo_{x:.0f}_{y:.0f}"
         bot.States.AddCustomState(_coro, name)
 
     if bot_vars.bless_path_data:
@@ -854,6 +871,15 @@ def _draw_settings():
             routine_set = False
             needs_routine_init = True
         ConsoleLog("UI", f"HeroAI {'enabled' if bot_vars.use_hero_ai else 'disabled'} - routine will rebuild")
+
+    # Enemy scanner toggle
+    new_use_enemy_scanner = PyImGui.checkbox("Enable Enemy Scanner", bot_vars.use_enemy_scanner)
+    if new_use_enemy_scanner != bot_vars.use_enemy_scanner:
+        bot_vars.use_enemy_scanner = new_use_enemy_scanner
+        if routine_set:
+            routine_set = False
+            needs_routine_init = True
+        ConsoleLog("UI", f"Enemy scanner {'enabled' if bot_vars.use_enemy_scanner else 'disabled'} - routine will rebuild")
     PyImGui.separator()
     
     # Region dropdown
